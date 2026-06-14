@@ -1,101 +1,227 @@
-use reqwest::blocking;
+// WARN: Remove at some point
+#![allow(unused)]
+
+use reqwest::{blocking::Client};
+use reqwest::header::{CONNECTION, CONTENT_TYPE};
+use serde::{Deserialize, Serialize};
+use serde_json;
 use std::env;
 use std::ffi::c_int;
 use std::io::{self, Write, IsTerminal};
 use std::mem::MaybeUninit;
 use libc;
 
-fn disable_echo() -> io::Result<()> {
+const APPLICATION_JSON: &str = "application/json";
+const KEEP_ALIVE: &str = "keep-alive";
+
+const API_SESSION: &str = "/sb-api/api/public/v1.0/auth/session";
+const API_VOLUME_ID: &str = "/sb-api/api/public/v1.0/volume/id";
+
+fn main()  {
+    match run() {
+        Ok(_) => {
+            std::process::exit(0);
+        }
+        Err(e) => {
+            reset_termios();
+            println!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run() -> io::Result<()> {
+    let args: Vec<String> = env::args().collect();
+    let mut buffer = String::with_capacity(1024);
+    // if args.len() < 2 {
+    //     return Err(
+    //         io::Error::new(io::ErrorKind::InvalidInput, "Missing argument")
+    //     );
+    // }
+
+    enable_raw_mode()?;
+
+    print!("EVO Address: ");
+    io::stdout().flush()?;
+
+    io::stdin().read_line(&mut buffer)?;
+    let evo = buffer.trim().to_string();
+    buffer.clear();
+
+    print!("Username: ");
+    io::stdout().flush()?;
+
+    io::stdin().read_line(&mut buffer)?;
+    let username = buffer.trim().to_string();
+    buffer.clear();
+
+    print!("Password: ");
+    io::stdout().flush()?;
+
+    disable_echo()?;
+    io::stdin().read_line(&mut buffer)?;
+    enable_echo()?;
+
+    println!("\n");
+    let password = buffer.trim().to_string();
+    buffer.clear();
+
+    let client = Client::new();
+    let session = session(client, &evo, &username, &password)?;
+
+    disable_raw_mode()?;
+
+    println!("Session ID: {}", session.id);
+
+    Ok(())
+}
+
+enum ConnectionType {
+    HTTP,
+    HTTPS,
+}
+
+#[derive(Serialize)]
+struct Auth {
+    name: String,
+    password: String,
+}
+
+struct Session {
+    id: String,
+    evo: String,
+    username: String,
+    password: String,
+}
+
+fn session(client: Client, evo: &str, username: &str, password: &str) -> io::Result<Session> {
+    let url = format!("http://{evo}/{API_SESSION}");
+    let auth = Auth {
+        name: username.to_string(),
+        password: password.to_string(),
+    };
+
+    #[derive(Deserialize)]
+    struct Data {
+        cookie: u32,
+    }
+
+
+    #[derive(Deserialize)]
+    struct Response {
+        status: String,
+        data: Option<Data>,
+    }
+
+    let payload = serde_json::to_string(&auth)?;
+    let Some(cookie) = client
+        .post(url)
+        .header(CONTENT_TYPE, APPLICATION_JSON)
+        .body(payload)
+        .send()
+        .ok()
+        .filter(|r| r.status() == 200)
+        .and_then(|r| r.json::<Response>().ok())
+        .filter(|r| r.status == "success")
+        .and_then(|r| r.data)
+        .map(|data| data.cookie.to_string()) else {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Unable to login"));
+        };
+
+    Ok(Session {
+        id: cookie,
+        evo: evo.to_string(),
+        username: username.to_string(),
+        password: password.to_string(),
+    })
+}
+
+fn reset_termios() {
+    let termios = tcgetattr().unwrap();
+    tcsetattr(&termios).unwrap();
+}
+
+fn disable_raw_mode() -> io::Result<()> {
+    stdin_is_terminal()?;
+    let mut new_termios = tcgetattr()?;
+    new_termios.c_lflag &= !libc::ICANON;
+    tcsetattr(&new_termios)?;
+
+    Ok(())
+}
+
+
+fn enable_raw_mode() -> io::Result<()> {
+    stdin_is_terminal()?;
+    let mut new_termios = tcgetattr()?;
+    new_termios.c_lflag |= libc::ICANON;
+    new_termios.c_lflag |= libc::ECHOE;
+    tcsetattr(&new_termios)?;
+
+    Ok(())
+}
+
+
+fn stdin_is_terminal() -> io::Result<()> {
     if !io::stdin().is_terminal() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported, "stdin is not a terminal")
         );
     }
 
+    Ok(())
+}
+
+
+fn tcgetattr() -> io::Result<libc::termios> {
+    stdin_is_terminal()?;
+
     unsafe {
         let mut termios = MaybeUninit::<libc::termios>::uninit();
         if libc::tcgetattr(libc::STDIN_FILENO, termios.as_mut_ptr()) != 0 {
             return Err(io::Error::last_os_error());
         }
 
-        let mut new_termios = termios.assume_init();
-        new_termios.c_lflag &= !libc::ECHO;
+        return Ok(termios.assume_init());
+    }
+}
 
-        if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &new_termios) != 0 {
+
+fn tcsetattr(termios: &libc::termios) -> io::Result<()> {
+    stdin_is_terminal()?;
+
+    unsafe {
+        if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, termios) != 0 {
             return Err(io::Error::last_os_error());
         }
+    }
+
+    Ok(())
+}
+
+fn disable_echo() -> io::Result<()> {
+    stdin_is_terminal()?;
+
+    unsafe {
+        let mut new_termios = tcgetattr()?;
+        new_termios.c_lflag &= !libc::ECHO;
+        tcsetattr(&new_termios)?;
 
         return Ok(())
     }
 }
 
 fn enable_echo() -> io::Result<()> {
-    if !io::stdin().is_terminal() {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "stdin is not a terminal"));
-    }
+    stdin_is_terminal()?;
 
     unsafe {
-        let mut termios = MaybeUninit::<libc::termios>::uninit();
-        if libc::tcgetattr(libc::STDIN_FILENO, termios.as_mut_ptr()) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        let mut new_termios = termios.assume_init();
-        new_termios.c_lflag &= libc::ECHO;
-
-        if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &new_termios) != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let mut new_termios = tcgetattr()?;
+        new_termios.c_lflag |= libc::ECHO;
+        tcsetattr(&new_termios)?;
     }
 
     Ok(())
 }
-
-fn main() -> io::Result<()> {
-    let args: Vec<String> = env::args().collect();
-    let mut buffer = String::with_capacity(1024);
-    if args.len() < 2 {
-        return Err(
-            io::Error::new(io::ErrorKind::InvalidInput, "Missing argument")
-        );
-    }
-
-    let s = &args[1];
-    println!("s = {s}");
-
-        print!("Username: ");
-        io::stdout().flush()?;
-        let _ = io::stdin().read_line(&mut buffer)?;
-        let username = buffer.trim().to_string();
-        buffer.clear();
-
-
-        print!("Password: ");
-        io::stdout().flush()?;
-
-        disable_echo()?;
-        let _ = io::stdin().read_line(&mut buffer)?;
-        let password = buffer.trim().to_string();
-        enable_echo()?;
-
-        println!("Username is: '{username}'");
-        println!("Password is: '{password}'");
-
-    Ok(())
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
