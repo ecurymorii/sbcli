@@ -941,6 +941,7 @@ dependencies = [
 name = "sbcli"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

@@ -1,81 +1,55 @@
 use reqwest::blocking;
 use std::env;
-
-
 use std::ffi::c_int;
 use std::io::{self, Write, IsTerminal};
 use std::mem::MaybeUninit;
+use libc;
 
-const STDIN_FILENO: c_int = 0;
-const TCSAFLUSH: c_int = 2;
-const TCSANOW: c_int = 0;
+fn disable_echo() -> io::Result<()> {
+    if !io::stdin().is_terminal() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported, "stdin is not a terminal")
+        );
+    }
 
-const ECHO: u32 = 1 << 3;
-
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct C_Termios {
-    c_iflag: u32,
-    c_oflag: u32,
-    c_cflag: u32,
-    c_lflag: u32,
-    c_line: u8,
-    c_cc: [u8; 32],
-    c_ispeed: u32,
-    c_ospeed: u32,
-}
-
-
-unsafe extern "C" {
-    fn tcgetattr(fd: c_int, termios_ptr: *mut C_Termios) -> c_int;
-    fn tcsetattr(fd: c_int, when: c_int, termios_ptr: *const C_Termios) -> c_int;
-    fn isatty(fd: c_int) -> c_int;
-}
-
-
-#[derive(Debug)]
-struct Termios {
-    guard: C_Termios,
-}
-
-impl Termios {
-    fn disable_echo() -> io::Result<Self> {
-        if io::stdout().is_terminal() {
-            unsafe {
-                print!("Password: ");
-                io::stdout().flush()?;
-                let mut termptr = MaybeUninit::<C_Termios>::uninit();
-                if tcgetattr(STDIN_FILENO, termptr.as_mut_ptr()) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-
-                let guard = termptr.assume_init();
-                let mut new_term = guard;
-                new_term.c_lflag &= !ECHO;
-
-                if tcsetattr(STDIN_FILENO, TCSANOW, &new_term) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-
-                return Ok(Termios {guard})
-            }
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported, "stdin is not a terminal")
-            );
+    unsafe {
+        let mut termios = MaybeUninit::<libc::termios>::uninit();
+        if libc::tcgetattr(libc::STDIN_FILENO, termios.as_mut_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
         }
+
+        let mut new_termios = termios.assume_init();
+        new_termios.c_lflag &= !libc::ECHO;
+
+        if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &new_termios) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        return Ok(())
     }
 }
 
-impl Drop for Termios {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = tcsetattr(STDIN_FILENO, TCSANOW, &self.guard);
+fn enable_echo() -> io::Result<()> {
+    if !io::stdin().is_terminal() {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "stdin is not a terminal"));
+    }
+
+    unsafe {
+        let mut termios = MaybeUninit::<libc::termios>::uninit();
+        if libc::tcgetattr(libc::STDIN_FILENO, termios.as_mut_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut new_termios = termios.assume_init();
+        new_termios.c_lflag &= libc::ECHO;
+
+        if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &new_termios) != 0 {
+            return Err(io::Error::last_os_error());
         }
     }
-}
 
+    Ok(())
+}
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -89,7 +63,6 @@ fn main() -> io::Result<()> {
     let s = &args[1];
     println!("s = {s}");
 
-    // if s == "login" {
         print!("Username: ");
         io::stdout().flush()?;
         let _ = io::stdin().read_line(&mut buffer)?;
@@ -97,20 +70,16 @@ fn main() -> io::Result<()> {
         buffer.clear();
 
 
-        // print!("Password: ");
-        // io::stdout().flush()?;
-        {
-            let _guard = Termios::disable_echo()?;
-            let _ = io::stdin().read_line(&mut buffer)?;
-            println!();
-        }
+        print!("Password: ");
+        io::stdout().flush()?;
 
+        disable_echo()?;
+        let _ = io::stdin().read_line(&mut buffer)?;
         let password = buffer.trim().to_string();
+        enable_echo()?;
 
         println!("Username is: '{username}'");
         println!("Password is: '{password}'");
-    // }
-    println!("{s}");
 
     Ok(())
 }
