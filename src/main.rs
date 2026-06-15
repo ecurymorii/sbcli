@@ -6,6 +6,7 @@ use reqwest::header::{CONNECTION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::env;
+use std::os::fd::RawFd;
 use std::ffi::c_int;
 use std::io::{self, Write, IsTerminal};
 use std::mem::MaybeUninit;
@@ -23,7 +24,6 @@ fn main()  {
             std::process::exit(0);
         }
         Err(e) => {
-            reset_termios();
             println!("Error: {e}");
             std::process::exit(1);
         }
@@ -39,7 +39,9 @@ fn run() -> io::Result<()> {
     //     );
     // }
 
-    enable_raw_mode()?;
+
+    let mut termios = Termios::new()?;
+    termios.set_mode(TerminalMode::Canonical)?;
 
     print!("EVO Address: ");
     io::stdout().flush()?;
@@ -58,9 +60,9 @@ fn run() -> io::Result<()> {
     print!("Password: ");
     io::stdout().flush()?;
 
-    disable_echo()?;
+    termios.set_echo(Echo::Disable)?;
     io::stdin().read_line(&mut buffer)?;
-    enable_echo()?;
+    termios.set_echo(Echo::Enable)?;
 
     println!("\n");
     let password = buffer.trim().to_string();
@@ -69,7 +71,7 @@ fn run() -> io::Result<()> {
     let client = Client::new();
     let session = session(client, &evo, &username, &password)?;
 
-    disable_raw_mode()?;
+    termios.set_mode(TerminalMode::Noncanonical)?;
 
     println!("Session ID: {}", session.id);
 
@@ -136,92 +138,84 @@ fn session(client: Client, evo: &str, username: &str, password: &str) -> io::Res
     })
 }
 
-fn reset_termios() {
-    let termios = tcgetattr().unwrap();
-    tcsetattr(&termios).unwrap();
+enum TerminalMode {
+    Canonical,
+    Noncanonical,
 }
 
-fn disable_raw_mode() -> io::Result<()> {
-    stdin_is_terminal()?;
-    let mut new_termios = tcgetattr()?;
-    new_termios.c_lflag &= !libc::ICANON;
-    tcsetattr(&new_termios)?;
-
-    Ok(())
+enum Echo {
+    Enable,
+    Disable,
 }
 
-
-fn enable_raw_mode() -> io::Result<()> {
-    stdin_is_terminal()?;
-    let mut new_termios = tcgetattr()?;
-    new_termios.c_lflag |= libc::ICANON;
-    new_termios.c_lflag |= libc::ECHOE;
-    tcsetattr(&new_termios)?;
-
-    Ok(())
+struct Termios {
+    fd: RawFd,
+    original: libc::termios,
+    current: libc::termios,
 }
 
+impl Termios {
+    pub fn new() -> io::Result<Self> {
+        let fd = libc::STDIN_FILENO;
+        let original = Termios::tcgetattr(fd)?;
+        let current = original;
 
-fn stdin_is_terminal() -> io::Result<()> {
-    if !io::stdin().is_terminal() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported, "stdin is not a terminal")
-        );
+        Ok(Termios { fd, original, current })
     }
 
-    Ok(())
-}
+    fn tcgetattr(fd: RawFd) -> io::Result<libc::termios> {
+        unsafe {
+            let mut termios = MaybeUninit::<libc::termios>::uninit();
+            if libc::tcgetattr(fd, termios.as_mut_ptr()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
 
-
-fn tcgetattr() -> io::Result<libc::termios> {
-    stdin_is_terminal()?;
-
-    unsafe {
-        let mut termios = MaybeUninit::<libc::termios>::uninit();
-        if libc::tcgetattr(libc::STDIN_FILENO, termios.as_mut_ptr()) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        return Ok(termios.assume_init());
-    }
-}
-
-
-fn tcsetattr(termios: &libc::termios) -> io::Result<()> {
-    stdin_is_terminal()?;
-
-    unsafe {
-        if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, termios) != 0 {
-            return Err(io::Error::last_os_error());
+            return Ok(termios.assume_init());
         }
     }
 
-    Ok(())
+
+    fn tcsetattr(fd: RawFd, termios: &libc::termios) -> io::Result<()> {
+        unsafe {
+            if libc::tcsetattr(fd, libc::TCSANOW, termios) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn set_mode(&mut self, mode: TerminalMode) -> io::Result<()> {
+        match mode {
+            TerminalMode::Canonical => {
+                self.current.c_lflag |= libc::ICANON;
+                self.current.c_lflag |= libc::ECHOE;
+            }
+            TerminalMode::Noncanonical => self.current.c_lflag |= libc::ICANON,
+        }
+
+        Self::tcsetattr(self.fd, &self.current)
+    }
+
+    pub fn set_echo(&mut self, status: Echo) -> io::Result<()> {
+        match status {
+            Echo::Disable => self.current.c_lflag &= !libc::ECHO,
+            Echo::Enable => self.current.c_lflag |= libc::ECHO,
+        }
+
+        Self::tcsetattr(self.fd, &self.current)
+    }
+
 }
 
-fn disable_echo() -> io::Result<()> {
-    stdin_is_terminal()?;
-
-    unsafe {
-        let mut new_termios = tcgetattr()?;
-        new_termios.c_lflag &= !libc::ECHO;
-        tcsetattr(&new_termios)?;
-
-        return Ok(())
+impl Drop for Termios {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = Self::tcsetattr(self.fd, &self.original);
+        }
     }
 }
 
-fn enable_echo() -> io::Result<()> {
-    stdin_is_terminal()?;
-
-    unsafe {
-        let mut new_termios = tcgetattr()?;
-        new_termios.c_lflag |= libc::ECHO;
-        tcsetattr(&new_termios)?;
-    }
-
-    Ok(())
-}
 
 
 
