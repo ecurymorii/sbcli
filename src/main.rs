@@ -17,6 +17,7 @@ const KEEP_ALIVE: &str = "keep-alive";
 
 const API_SESSION: &str = "/sb-api/api/public/v1.0/auth/session";
 const API_VOLUME_ID: &str = "/sb-api/api/public/v1.0/volume/id";
+const API_EVO: &str = "/v1/evo";
 
 fn main()  {
     match run() {
@@ -39,43 +40,114 @@ fn run() -> io::Result<()> {
     //     );
     // }
 
-
     let mut termios = Termios::new()?;
-    termios.set_mode(TerminalMode::Canonical)?;
+    termios.set_mode(TermMode::Canonical)?;
 
     print!("EVO Address: ");
     io::stdout().flush()?;
-
     io::stdin().read_line(&mut buffer)?;
     let evo = buffer.trim().to_string();
     buffer.clear();
 
     print!("Username: ");
     io::stdout().flush()?;
-
     io::stdin().read_line(&mut buffer)?;
     let username = buffer.trim().to_string();
     buffer.clear();
 
     print!("Password: ");
     io::stdout().flush()?;
-
     termios.set_echo(Echo::Disable)?;
     io::stdin().read_line(&mut buffer)?;
     termios.set_echo(Echo::Enable)?;
-
     println!("\n");
     let password = buffer.trim().to_string();
     buffer.clear();
 
     let client = Client::new();
-    let session = session(client, &evo, &username, &password)?;
+    let session = session(&client, evo, username, password)?;
 
-    termios.set_mode(TerminalMode::Noncanonical)?;
+    // println!("Session ID: {}", session.id);
 
-    println!("Session ID: {}", session.id);
+    let url = format!("http://{}/{API_EVO}", &session.evo);
+    let Some(evo_info) = client.get(url)
+        .header(reqwest::header::ACCEPT, APPLICATION_JSON)
+        .basic_auth(session.auth.name, Some(session.auth.password))
+        .send().ok()
+        .filter(|r| r.status() == 200)
+        .and_then(|r| r.json::<EVO>().ok()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Unable to retrieve EVO information"
+            ))
+    };
+
+    println!("{} | v{}        Domain: {}", evo_info.hostname, evo_info.version, evo_info.domain);
+    println!();
+
+    loop {
+        buffer.clear();
+
+        print!("SBCLI: ");
+        io::stdout().flush()?;
+
+        io::stdin().read_line(&mut buffer)?;
+        let input = buffer.trim();
+        let (command, remainder) = parse_input(input);
+
+        match command {
+            Command::Logout => break,
+            Command::Unknown => {
+                println!("Unknown Command");
+            }
+        }
+    }
 
     Ok(())
+}
+
+fn parse_input(input: &str) -> (Command, &str) {
+    let bytes = input.as_bytes();
+    let start = 0;
+    let mut end = start;
+
+    for byte in bytes {
+        if byte.is_ascii_whitespace() {
+            break;
+        }
+
+        end += 1;
+    }
+
+    let cmd = &input[start..end];
+
+    let command = match cmd {
+        s if s.eq_ignore_ascii_case("logout") => Command::Logout,
+        _ => Command::Unknown,
+    };
+
+    (command, "")
+}
+
+#[derive(Deserialize, Debug)]
+struct Timezone {
+    name: String,
+    offset: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct EVO {
+  version: String,
+  hostname: String,
+  domain: String,
+  uuid: String,
+  slingshot: String,
+  timezone: Timezone,
+}
+
+enum Command {
+    Logout,
+    Unknown,
 }
 
 enum ConnectionType {
@@ -92,15 +164,18 @@ struct Auth {
 struct Session {
     id: String,
     evo: String,
-    username: String,
-    password: String,
+    auth: Auth,
 }
 
-fn session(client: Client, evo: &str, username: &str, password: &str) -> io::Result<Session> {
-    let url = format!("http://{evo}/{API_SESSION}");
+fn session(
+    client: &Client,
+    evo: String,
+    username: String,
+    password: String,
+) -> io::Result<Session> {
     let auth = Auth {
-        name: username.to_string(),
-        password: password.to_string(),
+        name: username,
+        password: password,
     };
 
     #[derive(Deserialize)]
@@ -108,37 +183,39 @@ fn session(client: Client, evo: &str, username: &str, password: &str) -> io::Res
         cookie: u32,
     }
 
-
     #[derive(Deserialize)]
     struct Response {
         status: String,
         data: Option<Data>,
     }
 
-    let payload = serde_json::to_string(&auth)?;
+    let url = format!("http://{evo}/{API_SESSION}");
+    let auth_serialized = serde_json::to_string(&auth)?;
+
     let Some(cookie) = client
         .post(url)
         .header(CONTENT_TYPE, APPLICATION_JSON)
-        .body(payload)
-        .send()
-        .ok()
+        .body(auth_serialized)
+        .send().ok()
         .filter(|r| r.status() == 200)
         .and_then(|r| r.json::<Response>().ok())
         .filter(|r| r.status == "success")
         .and_then(|r| r.data)
         .map(|data| data.cookie.to_string()) else {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Unable to login"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Unable to login"
+            ));
         };
 
     Ok(Session {
         id: cookie,
-        evo: evo.to_string(),
-        username: username.to_string(),
-        password: password.to_string(),
+        evo,
+        auth,
     })
 }
 
-enum TerminalMode {
+enum TermMode {
     Canonical,
     Noncanonical,
 }
@@ -174,7 +251,6 @@ impl Termios {
         }
     }
 
-
     fn tcsetattr(fd: RawFd, termios: &libc::termios) -> io::Result<()> {
         unsafe {
             if libc::tcsetattr(fd, libc::TCSANOW, termios) != 0 {
@@ -185,13 +261,14 @@ impl Termios {
         Ok(())
     }
 
-    pub fn set_mode(&mut self, mode: TerminalMode) -> io::Result<()> {
+    pub fn set_mode(&mut self, mode: TermMode) -> io::Result<()> {
         match mode {
-            TerminalMode::Canonical => {
+            TermMode::Canonical => {
                 self.current.c_lflag |= libc::ICANON;
                 self.current.c_lflag |= libc::ECHOE;
             }
-            TerminalMode::Noncanonical => self.current.c_lflag |= libc::ICANON,
+            // WARN: I think this is a bug
+            TermMode::Noncanonical => self.current.c_lflag |= libc::ICANON,
         }
 
         Self::tcsetattr(self.fd, &self.current)
